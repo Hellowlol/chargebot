@@ -89,10 +89,11 @@ class Chargebot(hass.Hass):
         self._charger_id = "EH385021"  # Is this really needed?
         self.charge_plan = []
         self.app_callbacks = []
+        self._has_been_limited = None
 
         self.handle_cb_load_balance = self.listen_state(
             self.load_balance_cb, self.args["power_usage_in_w"]
-        )  #
+        )
         self.handle_cb_charge_plan = self.listen_state(
             self.chargeplan_cb,
             self.args["charger_status_entity"],
@@ -110,7 +111,7 @@ class Chargebot(hass.Hass):
         # Only for man testing atm, should run when the using the cb or schedule
         # after the prices for tomorrow is available.
         # self.create_a_charge_plan()
-        self.chargeplan_cb("kek", "all", None, None, {})
+        # self.chargeplan_cb("kek", "all", None, None, {})
 
         # Lets add this as a service so it can get
         # executed manually using the api
@@ -119,16 +120,16 @@ class Chargebot(hass.Hass):
         )
 
     def verify_car(self):
-        # This should be removed from this func and added to the cb.
-        if (
-            self.get_tracker_state(self.args["car_device_tracker_entity"]) != "home"
-        ):  # Config option
+        """verify that the car is home and connected to a charger."""
+        if self.get_tracker_state(self.args["car_device_tracker_entity"]) != "home":
             self.log("Didn't execute as your car isnt home.")
             return False
 
         if self.get_state(self.args["car_connected_to_charger"]) != "on":
             self.log("Didnt execute as your car isnt connected")
             return False
+
+        return True
 
     def clean_up(self):
         """Cancel all listeners and cancel everything."""
@@ -144,8 +145,6 @@ class Chargebot(hass.Hass):
                 self.cancel_listen_state(handle)
 
     def chargeplan_cb(self, entity, attribute, old, new, kwargs):
-        # self.log("chargeplan_cb executed")
-
         if self.create_a_charge_plan() is True:
             if len(self.chargeplan):
                 for start, end in self.chargeplan:
@@ -160,7 +159,6 @@ class Chargebot(hass.Hass):
                             if self.verify_car() is True:
                                 return self.call_service(data["service_type"])
                         else:
-                            # return self.call_service("notify/notify", message=service_type)
                             return self.call_service(data["service_type"])
 
                     self.log("Added starting charging at %s and stop at %s", start, end)
@@ -200,11 +198,9 @@ class Chargebot(hass.Hass):
         )
         car_kwh_battery = float(self.args["car_battery_size_kwh"])  # Config option
         # Based on the onboard charger in the car.
-        max_charge_speed = float(self.args.get("charger_max_speed_kwh", 11.0))  # kwh
+        max_charge_speed = float(self.args.get("charger_max_speed_kwh", 11.0))
 
-        state = self.get_state(
-            self.args["power_price_entity"], attribute="all"
-        )  # make this config
+        state = self.get_state(self.args["power_price_entity"], attribute="all")
         tomorrow = state.get("attributes", {}).get("raw_tomorrow", [])
         today = state.get("attributes", {}).get("raw_today", [])
         currency = state.get("attributes", {}).get("currency")
@@ -217,15 +213,15 @@ class Chargebot(hass.Hass):
             end = datetime.strptime(i["end"], str_format)
             # Lets skip all hours that is already passed.
             if now > start:
-                self.log("skipped %s bc hour is passed", start)
+                # self.log("skipped %s bc hour is passed", start)
                 continue
             elif ready_until is not None and start > ready_until:
-                self.log("skipped %s cb hour is after the car should be ready", start)
+                # elf.log("skipped %s cb hour is after the car should be ready", start)
                 continue
             else:
                 data = {"start": start, "end": end, "value": i["value"]}
                 if i["value"] is not None:
-                    self.log("data %s", data)
+                    # self.log("data %s", data)
                     avail_hours.append(data)
 
         if len(avail_hours):
@@ -268,10 +264,7 @@ class Chargebot(hass.Hass):
 
     def load_balance_cb(self, entity, attribute, old, new, kwargs):
         """Callback used to manage the loadbalance"""
-        if (
-            self.get_state(self.args["load_balance"], default="off")
-            == "off"
-        ):
+        if self.get_state(self.args["load_balance"], default="off") == "off":
             return
 
         pw_state = self.get_state(self.args["power_usage_in_w"])
@@ -292,7 +285,7 @@ class Chargebot(hass.Hass):
 
         else:
             # Should add some kind of cool down here..
-            self.log("TICK %s" % pw_state)
+            # self.log("TICK %s" % pw_state)
             if self._has_been_limited is True:
                 self.log("started charger again")
                 # Start the shit back up.
