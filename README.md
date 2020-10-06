@@ -5,8 +5,8 @@ This is chargebot that adds smart charging to any charger that can be controlled
 
 # Features
 - Create a chargeplan
-- A changeplan a timeperiod of the cheapest hours to fill your car with energy to the wanted soc before a certain time in the future
-- Loadbalance the energy usage to stop the charger so you dont blow your main fuse.
+- A changeplan is a timeperiod of the cheapest hours to fill your car with energy to the wanted soc before a certain time in the future
+- Loadbalance the energy usage so you don't blow your main fuse.
 
 Integrations in HA that is required.
 - nordpool (to get the energy prices)
