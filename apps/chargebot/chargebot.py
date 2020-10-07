@@ -1,4 +1,5 @@
 import math
+import statistics
 from datetime import datetime, timedelta
 from operator import itemgetter
 
@@ -215,11 +216,6 @@ class Chargebot(hass.Hass):
         if self.create_a_charge_plan() is True:
             if len(self.chargeplan):
                 for start, end in self.chargeplan:
-                    # Debugging
-                    now = self.datetime(aware=True)
-                    start = now + timedelta(seconds=30)
-                    end = now + timedelta(seconds=90)
-
                     self.log("Added starting charging at %s and stop at %s", start, end)
 
                     start_handle = self.run_at(
@@ -266,6 +262,7 @@ class Chargebot(hass.Hass):
         currency = state.get("attributes", {}).get("currency")
         possible_hours = today + tomorrow
         str_format = "%Y-%m-%dT%H:%M:%S%z"
+        nor_str_format = "%d.%m.%Y %H:%M:%S"
 
         avail_hours = []
         for i in possible_hours:
@@ -288,9 +285,16 @@ class Chargebot(hass.Hass):
                     avail_hours.append(data)
 
         if len(avail_hours):
-            number_of_kwh_to_charge = car_kwh_battery / 100 * car_soc
+            number_of_kwh_to_charge = car_kwh_battery - car_kwh_battery / 100 * car_soc
             numbers_of_hours_required_to_be_fully_charged = math.ceil(
                 number_of_kwh_to_charge / max_charge_speed
+            )
+
+            self.log(
+                "Need %s kwh hours %s",
+                number_of_kwh_to_charge,
+                numbers_of_hours_required_to_be_fully_charged,
+                level="INFO",
             )
 
             if (
@@ -305,19 +309,12 @@ class Chargebot(hass.Hass):
                 :numbers_of_hours_required_to_be_fully_charged
             ]
 
-            # This need to be more presice.
-            # we dont include nettleie 35,79 kwh
-            # the monthly fee is 315 ish
-            # also we can get amount of juice added using the charger or the car.
-            cost = 0
-            for ch in cheapest_hours:
-                cost += float(ch["value"])
-
             # Create a chargeplan with continues start and end as cars/chargers
             # dont like to get stopped/started
             chargeplan = get_continues_timespan(cheapest_hours)
             # For tesla is possible to get a sensor with time remaining until
             # soc in reached the charge limit.
+            cost = 0
 
             msg = []
             for i, part_plan in enumerate(chargeplan):
@@ -326,8 +323,19 @@ class Chargebot(hass.Hass):
                     part_plan[0],
                     part_plan[1],
                 )
-                # Add some formating for this. strftime
-                msg.append(f"{i+1}: {part_plan[0]} - {part_plan[1]}")
+                price_for_hour = []
+                for ch in cheapest_hours:
+                    if part_plan[0] <= ch["start"] and ch["end"] <= part_plan[1]:
+                        self.log(
+                            f"{part_plan[0]} {part_plan[1]} {ch['start']} {ch['end']} {ch['value']}",
+                            level="DEBUG",
+                        )
+                        price_for_hour.append(ch["value"])
+                        cost += float(ch["value"])
+
+                msg.append(
+                    f"{i+1}: {part_plan[0].strftime(nor_str_format)} - {part_plan[1].strftime(nor_str_format)} avg: {statistics.mean(price_for_hour)}"
+                )
 
             self.notify("\n".join(msg), title="Created chargeplan")
             self.log("Total cost should be %s %s", cost, currency, level="DEBUG")
@@ -350,7 +358,6 @@ class Chargebot(hass.Hass):
         )
         if float(pw_state) >= main_fuse_in_w:
             charger_state = self.get_state(self.args["charger_status_entity"])
-            # https://github.com/fondberg/easee_hass/
             if charger_state == self.args["charger_status_charging"]:
                 # it would be easier to just use toggle for this but some other
                 # chargers might not support toggle.
@@ -365,13 +372,10 @@ class Chargebot(hass.Hass):
         else:
             # Should add some kind of cool down here..
             # or atlease check vs the onboardcharger/max charger watt usage.
-            # self.log("TICK %s" % pw_state)
             if self._has_been_limited is True:
                 self.log("Started charger again", level="INFO")
-                # Start the shit back up.
                 self.charger_service(self.args["charger_service_start"], verify=False)
                 self._has_been_limited = False
-
                 self.notify(
                     "Started the charger was the power usage is less then main fuse"
                 )
