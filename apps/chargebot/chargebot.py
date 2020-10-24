@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from operator import itemgetter
 
 import hassapi as hass
+from adbase import app_lock
 
 
 """
@@ -42,33 +43,24 @@ charge_bot:
   power_usage_in_w: "sensor.mqtt_relay_energy_usage"
   # Required float in atp ex 63.0
   main_fuse: 63.0
-  # float
+  # Required float <= 1.0
+  main_fuse_limit: 0.9
+  # float, required
   volt: 230.0, reqiored
   # float, required
   phase: 3.0
-
-### END POWERSTUFF ###
+  ### END POWERSTUFF ###
 
   ### Charger options ###
   charger_ready_at: "input_datetime.car_ready_at"
-  # If you prefer that your charger should require rfid all the time and only open when neeed use
-  # charger_service_start: {"service": "easee/set_charger_access", "data": {charger_id: "EH385021", access_level: 1}}
-  # charger_service_end: {"service": "easee/set_charger_access", "data": {charger_id: "EH385021", access_level: 2}}
-  # Optional
-  charger_service_start: {"service": "easee/start", "data": {charger_id: "EH385021"}}
-  # Optional
-  charger_service_end: {"service": "easee/stop", "data": {charger_id: "EH385021"}}
-  # Optional
   charger_status_entity: "sensor.easee_charger_eh385021_status"
   # Optional
   charger_no_current_entity: "sensor.easee_charger_eh385021_reason_for_no_current"
-  # Optional
-  charger_temp_override = input_boolean.charger_temp_override
   ## END charger options ###
 
   ### Car options ###
   # optional, default to 0 the state cant be reached
-  car_battery_sensor_entity: "sensor.tesla_model_3_battery_sensor"
+  car_battery_sensor: "sensor.tesla_model_3_battery_sensor"
   car_battery_size_kwh: 72.5 # kwh
   car_onboard_charger_kwh = 11.0
   verify_car_connected_and_home: true # Set this to false
@@ -76,7 +68,10 @@ charge_bot:
   car_device_tracker_entity: device_tracker.tesla_model_3_location_tracker
   car_connected_to_charger: "binary_sensor.tesla_model_3_charger_sensor"
 
-
+needed_ = ["car_onboard_charger_kwh", "car_onboard_charger_kwh"]
+needed_inputs = ["charger_temp_override", "load_balance", "load_balance"]
+req_entities_user_added = ["charger_ready_at", "car_battery_sensor", ""]
+#entities = ["car_connected_to_charger", "charger_no_current_entity", "car_device_tracker_entity", "car_battery_sensor_entity", "charger_temp_override", "charger_ready_at"]
 """
 
 
@@ -115,8 +110,14 @@ class EaseeChargebot(hass.Hass):
         self._serial = None
         # cancel timer callbacks.
         self.chargeplan_handles = []
-        self._has_been_limited = None
-        self._limit_at = None
+        self._loadbalancer_last_value = None
+        self._charger_paused_by_loadbalance = None
+
+        self.PID = None
+
+        # To simulate..
+        self.simulate()
+        return
 
         self.handle_cb_load_balance = self.listen_state(
             self.load_balance_cb, self.args["power_usage_in_w"]
@@ -153,8 +154,7 @@ class EaseeChargebot(hass.Hass):
 
     def setup_config(self):
         """Try to find some settings for the user."""
-
-        serial_regex = r"(eh\d{6})"
+        # This is way to messy. FIXME
 
         all_states = self.get_state()
         conf = {}
@@ -162,24 +162,46 @@ class EaseeChargebot(hass.Hass):
         serial = None
         OK = False
 
-        # Add shit we need # TODO
-        required_config_keys = []
+        entity_start_name = ""
 
-        # try to find the id of the charger.
+        # Inputs the user has to create in home assistant
+        needed_inputs = ["charger_temp_override", "smart_charging", "load_balance"]
+        non_discoverable_entities = ["power_usage_in_w"]
+        # Should be able to pull all this from the api later.
+        charger_settings = ["main_fuse", "phase", "volt"]
+
+        if_missing_add_as_false = ["notify"]
+
+        # try to find the correct name
         for entity in all_states:
-            if entity.startswith("sensor.easee_charger") and entity.endswith("status"):
-                res = re.search(serial_regex, entity)
-                if res:
-                    serial = res.group(0)
-                    self._serial = serial
-                    break
+            if entity.startswith("sensor.easee") and entity.endswith("status"):
+                # Seems to be some changes to the entity names..
+                entity_start_name = entity.split(".")[1].replace("_status", "")
+                serial = self.get_state(
+                    "sensor.%s_status" % entity_start_name, attribute="id"
+                )
+                self._serial = serial.lower()
+                self.args["serial"] = serial
+                self.args["entity_start_name"] = entity_start_name
+                break
+
+        for config_arg in self.args:
+            if config_arg in needed_inputs:
+                if not self.entity_exists(self.args[config_arg]):
+                    self.log(
+                        "%s does not exists, will not be able to %s",
+                        self.args[config_arg],
+                        config_arg,
+                        level="INFO",
+                    )
                 else:
-                    raise
+                    needed_inputs.remove(config_arg)
 
+        # Add any sensor that we can find.
         for entity in all_states:
-            if entity == "sensor.easee_charger_%s_reason_for_no_current" % serial:
+            if entity == "sensor.%s_reason_for_no_current" % entity_start_name:
                 conf["charger_no_current_entity"] = entity
-            elif entity == "sensor.easee_charger_%s_status" % serial:
+            elif entity == "sensor.%s_status" % entity_start_name:
                 conf["charger_status_entity"] = entity
 
             elif entity.startswith("sensor.nordpool"):
@@ -196,24 +218,59 @@ class EaseeChargebot(hass.Hass):
 
     def access_level(self, locked=True):
         """Change access level on the charger, this will also start and stop the charge."""
-        serial = self.args["charger_service_start"]["data"]["charger_id"]
-        unlock = {
+        serial = self.args["serial"]
+        level = 2 if locked else 1
+        service_call = {
             "service": "easee/set_charger_access",
-            "data": {"charger_id": serial, "access_level": 1},
+            "data": {"charger_id": serial, "access_level": level},
         }
-        lock = {
-            "service": "easee/set_charger_access",
-            "data": {"charger_id": serial, "access_level": 2},
-        }
-        service_call = lock if locked else unlock
         return self.charger_service(service_call, verify=False)
 
+    def cmd(self, service_name):
+        return {"service": service_name, "data": {"charger_id": self.args["serial"]}}
+
     def stop_charge(self, verify=True):
-        call = {"service": "easee/start", "data": {"charger_id": self._serial}}
-        return self.charger_service(call, verify=verify)
+        return self.charger_service(self.cmd("easee/stop"), verify=verify)
 
     def start_charge(self, verify=True):
-        call = {"service": "easee/start", "data": {"charger_id": self._serial}}
+        return self.charger_service(self.cmd("easee/start"), verify=verify)
+
+    def pause_charge(self, verify=True):
+        return self.charger_service(self.cmd("easee/pause"), verify=verify)
+
+    def resume_charge(self, verify=True):
+        return self.charger_service(self.cmd("easee/resume"), verify=verify)
+
+    def toggle_charge(self, verify=True):
+        return self.charger_service(self.cmd("easee/toggle"), verify=verify)
+
+    def set_circuit_current_limit(self, value, verify=False):
+        if self._loadbalancer_last_value is None:
+            self._loadbalancer_last_value = value
+
+        circuit_id = self.get_state(
+            self.args["charger_status_entity"], attribute="circuit_id"
+        )
+        value = math.floor(float(value))
+        self._loadbalancer_last_value = value
+        call = {
+            "service": "easee/set_circuit_dynamic_current",
+            "data": {
+                "circuit_id": circuit_id,
+                "currentP1": value,
+                "currentP2": value,
+                "currentP3": value,
+            },
+        }
+        self.log("%s", call, level="DEBUG")
+
+        # Just for debugging so i can graph it
+        self.set_value("input_number.kw_set_by_loadbalance", self.amp_to_watt(value) / 1000)
+        self.set_value("input_number.amps_set_by_loadbalance", value)
+        if value < 6:
+            self.set_value("input_number.charger_paused_by_loadbalance", 0)
+        else:
+            self.set_value("input_number.charger_paused_by_loadbalance", 30)
         return self.charger_service(call, verify=verify)
 
     def cb_temp_allow(self, entity, attribute, old, new, kwargs):
@@ -230,7 +287,7 @@ class EaseeChargebot(hass.Hass):
             return
 
         # Use this to get better error message when my pr is included.
-        no_current = self.get_state(self.args["charger_no_current_entity"])
+        # no_current = self.get_state(self.args["charger_no_current_entity"])
 
         # Handle when the cars is connected or ready to charge.
         if old == "STANDBY" and new in ("READY_TO_CHARGE", "CAR_CONNECTED"):
@@ -270,6 +327,14 @@ class EaseeChargebot(hass.Hass):
         elif new == "STANDBY":
             self.cancel_change_plans()
 
+        elif old == "CHARGING" and new == "PAUSED":
+            if self._charger_paused_by_loadbalance is True:
+                self.log(
+                    "The charger was paused by loadbalance, just logging it #fixme",
+                    level="INFO",
+                )
+                # Should we reschedule the chargeplan ?
+
     def cb_smart_charging(self, entity, attribute, old, new, kwargs):
         """Handle create a chargeplan or cancel depending on the state change."""
         if old == "off" and new == "on":
@@ -297,7 +362,7 @@ class EaseeChargebot(hass.Hass):
 
         self.log(message, level="DEBUG")
 
-    def charger_service(self, data, verify=True):
+    def charger_service(self, data, verify=True, notify=False):
         """Send a service call to the charger."""
         service = data.pop("service")
         kw = data.pop("data", {})
@@ -309,7 +374,8 @@ class EaseeChargebot(hass.Hass):
             call = self.call_service(service, **kw)
 
         if call is not None:
-            self.notify("Sent charge service")
+            if notify is True:
+                self.notify("Sent charge service")
             return call
 
     def verify_car(self):
@@ -327,8 +393,9 @@ class EaseeChargebot(hass.Hass):
 
         return True
 
-    def clean_up(self):
+    def terminate(self):
         """Cancel all listeners and cancel everything."""
+        return
         # untested
         for handle in self.app_callbacks:
             self.cancel_listen_state(handle)
@@ -372,16 +439,8 @@ class EaseeChargebot(hass.Hass):
                         level="DEBUG",
                     )
 
-                    start_handle = self.run_at(
-                        self.charger_service,
-                        start,
-                        **self.args["charger_service_start"],
-                    )
-                    end_handle = self.run_at(
-                        self.charger_service,
-                        end,
-                        **self.args["charger_service_end"],
-                    )
+                    start_handle = self.run_at(self.start_charge, start)
+                    end_handle = self.run_at(self.stop_charge, end)
                     self.chargeplan_handles.append(start_handle)
                     self.chargeplan_handles.append(end_handle)
 
@@ -527,7 +586,7 @@ class EaseeChargebot(hass.Hass):
                 return False
 
         else:
-            # This isnt enoght time to get the car ready
+            # This isn't enough time to get the car ready
             # this can happen in the user sets ready until and it can't reach soc
             # in that time frame.
             msg = (
@@ -538,35 +597,130 @@ class EaseeChargebot(hass.Hass):
             self.log(msg, level="INFO")
             self.charger_service(self.args["charger_service_start"], verify=False)
 
-    def load_balance_cb(self, entity, attribute, old, new, kwargs):
-        """Callback used to manage the loadbalance"""
-        if self.get_state(self.args["load_balance"], default="off") == "off":
+    def watt_to_amp(self, value):
+        return float(value) / self.args["volt"] / math.sqrt(self.args["phase"])
+
+    def amp_to_watt(self, value):
+        return value * self.args["volt"] * math.sqrt(self.args["phase"])
+
+    @app_lock
+    def check_load(self, pw_state):
+        """helper to check the load of the power usage and see if we need to limit the amp to the charger."""
+
+        # I dont know why this is needed, seems to be some kind of race condition.
+        esn = self.args["entity_start_name"]
+        max_main_fuse_amps = self.args["main_fuse"] * 0.9
+        total_usage_in_amps = self.watt_to_amp(pw_state)
+
+        # How many amps are the charger using right now.
+        charger_usage_amps = float(self.get_state("sensor.%s_in_current" % esn))
+        # Max amps that can be used on the charger atm.
+        dynamic_circuit_current_limit = float(
+            self.get_state("sensor.%s_dynamic_circuit_current" % esn)
+        )
+        charger_current_max_amps = float(
+            self.get_state("sensor.%s_max_circuit_current" % esn)
+        )
+        # charger_current_max_amps = 16.0
+
+        house_usage_in_amps = total_usage_in_amps - charger_usage_amps
+        # Right now we reserve 10% of the amps to create some kind of buffer
+        # that might be to much you have small fuse and 400 v.
+        # Make a config option.? # TODO
+        amps_left = max_main_fuse_amps - house_usage_in_amps
+
+        if self._loadbalancer_last_value is None:
+            self._loadbalancer_last_value = 0  # dynamic_circuit_current_limit
+
+        if math.floor(amps_left) == math.floor(self._loadbalancer_last_value):
+            self.log(
+                "Has correct amps limit amps left %s last value %s",
+                amps_left,
+                self._loadbalancer_last_value,
+            )
             return
 
-        pw_state = self.get_state(self.args["power_usage_in_w"])
-        main_fuse_in_w = (
-            self.args["main_fuse"] * self.args["volt"] * math.sqrt(self.args["phase"])
-        )
-        if float(pw_state) >= main_fuse_in_w:
-            charger_state = self.get_state(self.args["charger_status_entity"])
-            if charger_state == "CHARGING":
-                # it would be easier to just use toggle for this but some other
-                # chargers might not support toggle.
-                self.charger_service(self.args["charger_service_end"], verify=False)
-                self._limit_at = self.datetime(aware=True)
-                msg = "The charger was stopped/limited because the power usage is higher then main fuse"
-                self.notify(msg)
-                self.log(msg, level="INFO")
-            else:
-                self.log("Over limit but the charger isnt charging..", level="INFO")
-
-        else:
-            if self._limit_at is not None and self.datetime(
-                aware=True
-            ) - self._limit_at > timedelta(minutes=10):
-                self.log("Started charger again", level="INFO")
-                self.charger_service(self.args["charger_service_start"], verify=False)
-                self._limit_at = None
-                self.notify(
-                    "Started the charger was the power usage is less then main fuse"
+        if amps_left < self._loadbalancer_last_value:
+            self.log(
+                "Need to limit the charger as we only got %sA (%sW) available but the charger can use %sA",
+                amps_left,
+                pw_state,
+                self._loadbalancer_last_value,
+                level="DEBUG",
+            )
+            # This is only for the logging, the charger should be paused if the amp is less then 6
+            # maybe check what error code is used.
+            if amps_left < 6:
+                self.log(
+                    "Charger will paused because of amp %s < 6",
+                    amps_left,
+                    level="DEBUG",
                 )
+                self._charger_paused_by_loadbalance = True
+                amps_left = 5
+            new_amp_limit = min(amps_left, charger_current_max_amps)
+            self.set_circuit_current_limit(new_amp_limit)
+            self._loadbalancer_last_value = new_amp_limit
+
+        elif amps_left > self._loadbalancer_last_value:
+            new_amp_limit = min(amps_left, charger_current_max_amps)
+            self.log(
+                "Can increase the dynamic_circuit_current_limit %sA to current %sA",
+                self._loadbalancer_last_value,
+                new_amp_limit,
+                level="DEBUG",
+            )
+            self.set_circuit_current_limit(new_amp_limit)
+            self._loadbalancer_last_value = new_amp_limit
+
+            if new_amp_limit > 6:
+                self._charger_paused_by_loadbalance = False
+
+        self.log("Charger watt %s from sensor", self.amp_to_watt(charger_usage_amps))
+        self.log(
+            "Using a total of %sA (%sW) amps house: %sA (%sW) main_fuse %sA charger: %sA (%sW) got %s left charger limit is %s fuse %s",
+            total_usage_in_amps,
+            self.amp_to_watt(total_usage_in_amps),
+            house_usage_in_amps,
+            self.amp_to_watt(house_usage_in_amps),
+            self.args["main_fuse"],
+            charger_usage_amps,
+            self.amp_to_watt(charger_usage_amps),
+            amps_left,
+            self._loadbalancer_last_value,
+            charger_current_max_amps,
+            level="DEBUG",
+        )
+
+    def simulate(self, fra=None, til=None):
+        """Grab the history, just do debugging, delete it later."""
+
+        if fra is None:
+            fra = "2020-10-24 00:00:00+02:00"
+        if til is None:
+            til = "2020-10-24 06:00:00+02:00"
+
+        stop_at = datetime.fromisoformat(til)
+        data = self.get_history(
+            entity_id="sensor.mqtt_relay_energy_usage", start_time=fra
+        )
+
+        for d in data:
+            for z in d:
+                dt = datetime.fromisoformat(z["last_changed"])
+
+                if dt > stop_at:
+                    break
+                else:
+                    self.check_load(z["state"])
+
+    def load_balance_cb(self, entity, attribute, old, new, kwargs):
+        """Callback that use called when a new power usage is posted in ha."""
+        # Quick check to see if need to compute anything.
+        use_balance = self.get_state(self.args["load_balance"])
+        charger_status = self.get_state(self.args["charger_status_entity"])
+        # Cba loadbalance if the charger is idle.
+        if charger_status in ("STANDBY", "PAUSED") or use_balance == "off":
+            return
+        if old != new:
+            self.check_load(new)
